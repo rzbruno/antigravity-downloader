@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+
+# ==============================================================================
+# Google Antigravity Downloader & Updater (Antigravity 2.0, IDE, and CLI)
+# Managed under ~/.local/share/ and ~/.local/bin/
+# Only downloads and updates components if a new version is available
+# ==============================================================================
+
+set -euo pipefail
+
+SHARE_DIR="$HOME/.local/share"
+BIN_DIR="$HOME/.local/bin"
+DESKTOP_DIR="$HOME/.local/share/applications"
+
+DESKTOP_TARGET="$SHARE_DIR/antigravity"
+IDE_TARGET="$SHARE_DIR/antigravity-ide"
+
+DOWNLOAD_PAGE="https://antigravity.google/download"
+CLI_INSTALL_URL="https://antigravity.google/cli/install.sh"
+
+log() { printf '\e[32m[INFO]\e[0m %s\n' "$*"; }
+warn() { printf '\e[33m[WARN]\e[0m %s\n' "$*"; }
+err() { printf '\e[31m[ERROR]\e[0m %s\n' "$*" >&2; exit 1; }
+
+FORCE=false
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -f|--force)
+            FORCE=true
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $(basename "$0") [options]"
+            echo ""
+            echo "Options:"
+            echo "  -f, --force    Force download and reinstallation even if already up to date"
+            echo "  -h, --help     Show this help message"
+            exit 0
+            ;;
+        *)
+            err "Unknown option: $1"
+            ;;
+    esac
+done
+
+download_file() {
+    local url="$1"
+    local dest="$2"
+    curl -fsSL -C - --retry 10 --retry-all-errors --retry-connrefused --retry-delay 2 --progress-bar -o "$dest" "$url"
+}
+
+is_up_to_date() {
+    local local_ver="$1"
+    local remote_ver="$2"
+    if [ -z "$local_ver" ] || [ -z "$remote_ver" ]; then
+        return 1
+    fi
+    if [ "$local_ver" = "$remote_ver" ]; then
+        return 0
+    fi
+    local remote_semver="${remote_ver%%-*}"
+    # If local version only recorded semver without build metadata
+    if [ "$local_ver" = "$remote_semver" ]; then
+        return 0
+    fi
+    return 1
+}
+
+get_desktop_local_version() {
+    if [ -f "$DESKTOP_TARGET/.version" ]; then
+        cat "$DESKTOP_TARGET/.version"
+        return 0
+    fi
+    if [ -f "$DESKTOP_TARGET/resources/app.asar" ] && command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import os, struct, json, sys
+try:
+    with open(sys.argv[1], "rb") as f:
+        u1, u2, u3, u4 = struct.unpack("<IIII", f.read(16))
+        header = json.loads(f.read(u4).decode("utf-8"))
+        pkg = header["files"]["package.json"]
+        f.seek(8 + u2 + int(pkg["offset"]))
+        pkg_data = json.loads(f.read(int(pkg["size"])).decode("utf-8"))
+        print(pkg_data.get("version", ""))
+except Exception:
+    pass
+' "$DESKTOP_TARGET/resources/app.asar" 2>/dev/null
+        return 0
+    fi
+    return 1
+}
+
+get_ide_local_version() {
+    if [ -f "$IDE_TARGET/.version" ]; then
+        cat "$IDE_TARGET/.version"
+        return 0
+    fi
+    local prod_json="$IDE_TARGET/resources/app/product.json"
+    if [ -f "$prod_json" ]; then
+        local ver
+        ver=$(grep -oE '"ideVersion"[[:space:]]*:[[:space:]]*"[^"]+"' "$prod_json" | head -n 1 | cut -d'"' -f4 || true)
+        if [ -n "$ver" ]; then
+            echo "$ver"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+get_cli_local_version() {
+    if [ -x "$BIN_DIR/agy" ]; then
+        "$BIN_DIR/agy" --version 2>/dev/null || true
+    elif command -v agy >/dev/null 2>&1; then
+        agy --version 2>/dev/null || true
+    fi
+}
+
+get_cli_platform() {
+    local os arch
+    case "$(uname -s)" in
+        Darwin) os="darwin" ;;
+        Linux) if [ "$(uname -o 2>/dev/null)" = "Android" ]; then os="android"; else os="linux"; fi ;;
+        *) os="linux" ;;
+    esac
+    case "$(uname -m)" in
+        x86_64|amd64) arch="amd64" ;;
+        arm64|aarch64) arch="arm64" ;;
+        *) arch="amd64" ;;
+    esac
+    if [ "$os" = "linux" ]; then
+        if [ -f /lib/libc.musl-x86_64.so.1 ] || [ -f /lib/libc.musl-aarch64.so.1 ] || ldd /bin/ls 2>&1 | grep -q musl; then
+            echo "linux_${arch}_musl"
+        else
+            echo "linux_${arch}"
+        fi
+    else
+        echo "${os}_${arch}"
+    fi
+}
+
+mkdir -p "$SHARE_DIR" "$BIN_DIR" "$DESKTOP_DIR"
+
+TMP_DIR=$(mktemp -d -t antigravity-downloader-XXXXXX)
+cleanup() {
+    rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+log "Fetching release information from Google Antigravity..."
+
+# 1. Fetch download page HTML & extract download links
+PAGE_HTML=$(curl -fsSL --compressed -H "User-Agent: Mozilla/5.0" "$DOWNLOAD_PAGE" 2>/dev/null || true)
+
+DESKTOP_URL=$(echo "$PAGE_HTML" | grep -oE 'https?://[^"'\''`[:space:]<>{};]+/linux-x64/Antigravity\.tar\.gz' | head -n 1 || true)
+if [ -z "$DESKTOP_URL" ]; then
+    DESKTOP_URL=$(echo "$PAGE_HTML" | grep -oE 'https?://[^"'\''`[:space:]<>{};]+/linux-x64/[^"'\''`[:space:]<>{};]*Antigravity[^"'\''`[:space:]<>{};]*\.tar\.gz' | head -n 1 || true)
+fi
+if [ -z "$DESKTOP_URL" ]; then
+    LATEST_RELEASE=$(curl -fsSL "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/releases" 2>/dev/null || true)
+    if [ -n "$LATEST_RELEASE" ]; then
+        REL_VER=$(echo "$LATEST_RELEASE" | grep -oE '"version":"[^"]+"' | head -n 1 | cut -d'"' -f4 || true)
+        REL_EXEC=$(echo "$LATEST_RELEASE" | grep -oE '"execution_id":"[^"]+"' | head -n 1 | cut -d'"' -f4 || true)
+        if [ -n "$REL_VER" ] && [ -n "$REL_EXEC" ]; then
+            DESKTOP_URL="https://storage.googleapis.com/antigravity-public/antigravity-hub/${REL_VER}-${REL_EXEC}/linux-x64/Antigravity.tar.gz"
+        fi
+    fi
+fi
+
+IDE_URL=$(echo "$PAGE_HTML" | grep -oE 'https?://[^"'\''`[:space:]<>{};]+/linux-x64/[^"'\''`[:space:]<>{};]*IDE[^"'\''`[:space:]<>{};]*\.tar\.gz' | head -n 1 || true)
+if [ -z "$IDE_URL" ]; then
+    IDE_URL=$(echo "$PAGE_HTML" | grep -oE 'https?://[^"'\''`[:space:]<>{};]+/linux-x64/[^"'\''`[:space:]<>{};]*ide[^"'\''`[:space:]<>{};]*\.tar\.gz' | head -n 1 || true)
+fi
+
+CLI_PLATFORM=$(get_cli_platform)
+CLI_MANIFEST_URL="https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/${CLI_PLATFORM}.json"
+CLI_MANIFEST=$(curl -fsSL "$CLI_MANIFEST_URL" 2>/dev/null || true)
+CLI_REMOTE_VER=$(echo "$CLI_MANIFEST" | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n 1 | cut -d'"' -f4 || true)
+
+if [ -z "$DESKTOP_URL" ]; then
+    err "Could not resolve Linux x64 download URL for Antigravity 2.0."
+fi
+
+if [ -z "$IDE_URL" ]; then
+    err "Could not resolve Linux x64 download URL for Antigravity IDE."
+fi
+
+DESKTOP_REMOTE_VER=$(echo "$DESKTOP_URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -n 1 || true)
+IDE_REMOTE_VER=$(echo "$IDE_URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -n 1 || true)
+
+DESKTOP_LOCAL_VER=$(get_desktop_local_version || true)
+IDE_LOCAL_VER=$(get_ide_local_version || true)
+CLI_LOCAL_VER=$(get_cli_local_version || true)
+
+UPDATE_DESKTOP=false
+UPDATE_IDE=false
+UPDATE_CLI=false
+
+if [ "$FORCE" = true ]; then
+    log "Force flag enabled: updating all components."
+    UPDATE_DESKTOP=true
+    UPDATE_IDE=true
+    UPDATE_CLI=true
+else
+    # Check Antigravity 2.0 (Desktop App)
+    if [ ! -f "$DESKTOP_TARGET/antigravity" ] || [ -z "$DESKTOP_LOCAL_VER" ]; then
+        UPDATE_DESKTOP=true
+    elif ! is_up_to_date "$DESKTOP_LOCAL_VER" "$DESKTOP_REMOTE_VER"; then
+        UPDATE_DESKTOP=true
+    else
+        echo "$DESKTOP_REMOTE_VER" > "$DESKTOP_TARGET/.version" 2>/dev/null || true
+    fi
+
+    # Check Antigravity IDE
+    if [ ! -f "$IDE_TARGET/antigravity-ide" ] || [ -z "$IDE_LOCAL_VER" ]; then
+        UPDATE_IDE=true
+    elif ! is_up_to_date "$IDE_LOCAL_VER" "$IDE_REMOTE_VER"; then
+        UPDATE_IDE=true
+    else
+        echo "$IDE_REMOTE_VER" > "$IDE_TARGET/.version" 2>/dev/null || true
+    fi
+
+    # Check Antigravity CLI (agy)
+    if [ ! -x "$BIN_DIR/agy" ] || [ -z "$CLI_LOCAL_VER" ]; then
+        UPDATE_CLI=true
+    elif [ -n "$CLI_REMOTE_VER" ] && [ "$CLI_LOCAL_VER" != "$CLI_REMOTE_VER" ]; then
+        UPDATE_CLI=true
+    fi
+fi
+
+# Ensure launcher symlinks exist
+ensure_symlinks() {
+    if [ -f "$DESKTOP_TARGET/antigravity" ]; then
+        ln -sfn ../share/antigravity/antigravity "$BIN_DIR/antigravity"
+    fi
+    if [ -f "$IDE_TARGET/antigravity-ide" ]; then
+        ln -sfn ../share/antigravity-ide/antigravity-ide "$BIN_DIR/antigravity-ide"
+    fi
+    local script_path
+    script_path="$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "")"
+    if [ -n "$script_path" ] && [ -f "$script_path" ] && [ "$script_path" != "$BIN_DIR/antigravity-downloader" ]; then
+        ln -sfn "$script_path" "$BIN_DIR/antigravity-downloader"
+        ln -sfn "$script_path" "$BIN_DIR/update-antigravity"
+    fi
+}
+
+# Ensure desktop application launchers exist
+ensure_desktop_launchers() {
+    cat > "$DESKTOP_DIR/antigravity.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Antigravity
+Exec=$HOME/.local/share/antigravity/antigravity %U
+Icon=$HOME/.local/share/antigravity-ide/resources/app/resources/linux/code.png
+Comment=Google Antigravity 2.0
+Categories=Utility;Development;
+Terminal=false
+MimeType=x-scheme-handler/antigravity;
+EOF
+
+    cat > "$DESKTOP_DIR/antigravity-ide.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Antigravity IDE
+Exec=$HOME/.local/share/antigravity-ide/antigravity-ide %F
+Icon=$HOME/.local/share/antigravity-ide/resources/app/resources/linux/code.png
+Comment=Google Antigravity IDE
+Categories=Utility;Development;
+Terminal=false
+EOF
+
+    chmod +x "$DESKTOP_DIR/antigravity.desktop" "$DESKTOP_DIR/antigravity-ide.desktop"
+
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+    fi
+}
+
+# Fast path: check if everything is already up to date
+if [ "$UPDATE_DESKTOP" = false ] && [ "$UPDATE_IDE" = false ] && [ "$UPDATE_CLI" = false ]; then
+    log "All Antigravity components are already up to date!"
+    log "  - Antigravity 2.0: ${DESKTOP_LOCAL_VER:-unknown} (latest)"
+    log "  - Antigravity IDE: ${IDE_LOCAL_VER:-unknown} (latest)"
+    log "  - Antigravity CLI: ${CLI_LOCAL_VER:-unknown} (latest)"
+    ensure_symlinks
+    ensure_desktop_launchers
+    log "No update needed."
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# 2. Update Antigravity 2.0 (Desktop App)
+# ------------------------------------------------------------------------------
+if [ "$UPDATE_DESKTOP" = true ]; then
+    log "Updating Antigravity 2.0 (${DESKTOP_LOCAL_VER:-none} -> ${DESKTOP_REMOTE_VER:-latest})..."
+    log "Downloading Antigravity 2.0..."
+    DESKTOP_TAR="$TMP_DIR/antigravity.tar.gz"
+    download_file "$DESKTOP_URL" "$DESKTOP_TAR"
+
+    log "Extracting Antigravity 2.0..."
+    DESKTOP_EXTRACT="$TMP_DIR/desktop_extracted"
+    mkdir -p "$DESKTOP_EXTRACT"
+    tar -xzf "$DESKTOP_TAR" -C "$DESKTOP_EXTRACT"
+
+    DESKTOP_SRC=$(find "$DESKTOP_EXTRACT" -maxdepth 3 -type f -name "antigravity" ! -path "*/bin/*" | head -n 1)
+    if [ -n "$DESKTOP_SRC" ]; then
+        DESKTOP_SRC=$(dirname "$DESKTOP_SRC")
+    fi
+
+    if [ -z "$DESKTOP_SRC" ] || [ ! -d "$DESKTOP_SRC" ]; then
+        err "Failed to locate 'antigravity' executable inside downloaded package."
+    fi
+
+    log "Installing Antigravity 2.0 to $DESKTOP_TARGET..."
+    rm -rf "${DESKTOP_TARGET}.new" "${DESKTOP_TARGET}.old"
+    cp -a "$DESKTOP_SRC" "${DESKTOP_TARGET}.new"
+    if [ -d "$DESKTOP_TARGET" ]; then
+        mv "$DESKTOP_TARGET" "${DESKTOP_TARGET}.old"
+    fi
+    mv "${DESKTOP_TARGET}.new" "$DESKTOP_TARGET"
+    rm -rf "${DESKTOP_TARGET}.old"
+
+    echo "$DESKTOP_REMOTE_VER" > "$DESKTOP_TARGET/.version"
+    ln -sfn ../share/antigravity/antigravity "$BIN_DIR/antigravity"
+    log "Antigravity 2.0 updated successfully to $DESKTOP_REMOTE_VER."
+else
+    log "Antigravity 2.0 is already up to date (${DESKTOP_LOCAL_VER}). Skipping download."
+fi
+
+# ------------------------------------------------------------------------------
+# 3. Update Antigravity IDE
+# ------------------------------------------------------------------------------
+if [ "$UPDATE_IDE" = true ]; then
+    log "Updating Antigravity IDE (${IDE_LOCAL_VER:-none} -> ${IDE_REMOTE_VER:-latest})..."
+    log "Downloading Antigravity IDE..."
+    IDE_TAR="$TMP_DIR/antigravity-ide.tar.gz"
+    download_file "$IDE_URL" "$IDE_TAR"
+
+    log "Extracting Antigravity IDE..."
+    IDE_EXTRACT="$TMP_DIR/ide_extracted"
+    mkdir -p "$IDE_EXTRACT"
+    tar -xzf "$IDE_TAR" -C "$IDE_EXTRACT"
+
+    IDE_SRC=$(find "$IDE_EXTRACT" -maxdepth 3 -type f -name "antigravity-ide" ! -path "*/bin/*" | head -n 1)
+    if [ -n "$IDE_SRC" ]; then
+        IDE_SRC=$(dirname "$IDE_SRC")
+    fi
+
+    if [ -z "$IDE_SRC" ] || [ ! -d "$IDE_SRC" ]; then
+        err "Failed to locate 'antigravity-ide' executable inside downloaded package."
+    fi
+
+    log "Installing Antigravity IDE to $IDE_TARGET..."
+    rm -rf "${IDE_TARGET}.new" "${IDE_TARGET}.old"
+    cp -a "$IDE_SRC" "${IDE_TARGET}.new"
+    if [ -d "$IDE_TARGET" ]; then
+        mv "$IDE_TARGET" "${IDE_TARGET}.old"
+    fi
+    mv "${IDE_TARGET}.new" "$IDE_TARGET"
+    rm -rf "${IDE_TARGET}.old"
+
+    echo "$IDE_REMOTE_VER" > "$IDE_TARGET/.version"
+    ln -sfn ../share/antigravity-ide/antigravity-ide "$BIN_DIR/antigravity-ide"
+    log "Antigravity IDE updated successfully to $IDE_REMOTE_VER."
+else
+    log "Antigravity IDE is already up to date (${IDE_LOCAL_VER}). Skipping download."
+fi
+
+# ------------------------------------------------------------------------------
+# 4. Update Antigravity CLI (agy)
+# ------------------------------------------------------------------------------
+if [ "$UPDATE_CLI" = true ]; then
+    log "Updating Antigravity CLI (agy) (${CLI_LOCAL_VER:-none} -> ${CLI_REMOTE_VER:-latest})..."
+    if [ -f "$BIN_DIR/agy" ]; then
+        mv "$BIN_DIR/agy" "$BIN_DIR/agy.updating"
+    fi
+    if curl -fsSL "$CLI_INSTALL_URL" | bash; then
+        rm -f "$BIN_DIR/agy.updating"
+        log "Antigravity CLI (agy) updated successfully."
+    else
+        if [ -f "$BIN_DIR/agy.updating" ]; then
+            mv "$BIN_DIR/agy.updating" "$BIN_DIR/agy"
+        fi
+        err "Failed to update Antigravity CLI (agy)."
+    fi
+else
+    log "Antigravity CLI (agy) is already up to date (${CLI_LOCAL_VER}). Skipping."
+fi
+
+# ------------------------------------------------------------------------------
+# 5. Desktop Application Integration (.desktop files) & Symlinks
+# ------------------------------------------------------------------------------
+ensure_symlinks
+ensure_desktop_launchers
+
+log "Antigravity update completed successfully!"
+log "Status:"
+log "  - Antigravity 2.0: $(get_desktop_local_version || echo 'unknown')"
+log "  - Antigravity IDE: $(get_ide_local_version || echo 'unknown')"
+log "  - Antigravity CLI: $(get_cli_local_version || echo 'unknown')"
